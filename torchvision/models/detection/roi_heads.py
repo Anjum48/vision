@@ -226,6 +226,17 @@ def _onnx_heatmaps_to_keypoints_loop(maps, rois, widths_ceil, heights_ceil,
     return xy_preds, end_scores
 
 
+# workaround for issue pytorch 27512
+def tensor_floordiv(tensor, int_div):
+    # type: (Tensor, int)
+    result = tensor / int_div
+    # TODO: https://github.com/pytorch/pytorch/issues/26731
+    floating_point_types = (torch.float, torch.double, torch.half)
+    if result.dtype in floating_point_types:
+        result = result.trunc()
+    return result
+
+
 def heatmaps_to_keypoints(maps, rois):
     """Extract predicted keypoint locations from heatmaps. Output has shape
     (#rois, 4, #keypoints) with the 4 rows corresponding to (x, y, logit, prob)
@@ -269,7 +280,7 @@ def heatmaps_to_keypoints(maps, rois):
         pos = roi_map.reshape(num_keypoints, -1).argmax(dim=1)
 
         x_int = pos % w
-        y_int = (pos - x_int) // w
+        y_int = tensor_floordiv((pos - x_int), w)
         # assert (roi_map_probs[k, y_int, x_int] ==
         #         roi_map_probs[k, :, :].max())
         x = (x_int.float() + 0.5) * width_correction
@@ -657,7 +668,7 @@ class RoIHeads(torch.nn.Module):
         regression_targets = self.box_coder.encode(matched_gt_boxes, proposals)
         return proposals, matched_idxs, labels, regression_targets
 
-    def postprocess_detections(self, class_logits, box_regression, proposals, image_shapes):
+    def postprocess_detections(self, class_logits, box_regression, proposals, image_shapes, box_features):
         # type: (Tensor, Tensor, List[Tensor], List[Tuple[int, int]])
         device = class_logits.device
         num_classes = class_logits.shape[-1]
@@ -673,14 +684,17 @@ class RoIHeads(torch.nn.Module):
             # and just assign to pred_boxes instead of pred_boxes_list
             pred_boxes_list = [pred_boxes]
             pred_scores_list = [pred_scores]
+            pred_embeddings_list = [box_features]
         else:
             pred_boxes_list = pred_boxes.split(boxes_per_image, 0)
             pred_scores_list = pred_scores.split(boxes_per_image, 0)
+            pred_embeddings_list = box_features.split(boxes_per_image, 0)
 
         all_boxes = []
         all_scores = []
         all_labels = []
-        for boxes, scores, image_shape in zip(pred_boxes_list, pred_scores_list, image_shapes):
+        all_embeddings = []
+        for boxes, scores, image_shape, embeddings in zip(pred_boxes_list, pred_scores_list, image_shapes, pred_embeddings_list):
             boxes = box_ops.clip_boxes_to_image(boxes, image_shape)
 
             # create labels for each prediction
@@ -693,29 +707,31 @@ class RoIHeads(torch.nn.Module):
             labels = labels[:, 1:]
 
             # batch everything, by making every class prediction be a separate instance
+            embeddings = torch.repeat_interleave(embeddings, scores.size(1), 0)
             boxes = boxes.reshape(-1, 4)
             scores = scores.reshape(-1)
             labels = labels.reshape(-1)
 
             # remove low scoring boxes
             inds = torch.nonzero(scores > self.score_thresh).squeeze(1)
-            boxes, scores, labels = boxes[inds], scores[inds], labels[inds]
+            boxes, scores, labels, embeddings = boxes[inds], scores[inds], labels[inds], embeddings[inds]
 
             # remove empty boxes
             keep = box_ops.remove_small_boxes(boxes, min_size=1e-2)
-            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+            boxes, scores, labels, embeddings = boxes[keep], scores[keep], labels[keep], embeddings[keep]
 
             # non-maximum suppression, independently done per class
             keep = box_ops.batched_nms(boxes, scores, labels, self.nms_thresh)
             # keep only topk scoring predictions
             keep = keep[:self.detections_per_img]
-            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+            boxes, scores, labels, embeddings = boxes[keep], scores[keep], labels[keep], embeddings[keep]
 
             all_boxes.append(boxes)
             all_scores.append(scores)
             all_labels.append(labels)
+            all_embeddings.append(embeddings)
 
-        return all_boxes, all_scores, all_labels
+        return all_boxes, all_scores, all_labels, all_embeddings
 
     def forward(self, features, proposals, image_shapes, targets=None):
         # type: (Dict[str, Tensor], List[Tensor], List[Tuple[int, int]], Optional[List[Dict[str, Tensor]]])
@@ -757,7 +773,7 @@ class RoIHeads(torch.nn.Module):
                 "loss_box_reg": loss_box_reg
             }
         else:
-            boxes, scores, labels = self.postprocess_detections(class_logits, box_regression, proposals, image_shapes)
+            boxes, scores, labels, embeddings = self.postprocess_detections(class_logits, box_regression, proposals, image_shapes, box_features)
             num_images = len(boxes)
             for i in range(num_images):
                 result.append(
@@ -765,6 +781,7 @@ class RoIHeads(torch.nn.Module):
                         "boxes": boxes[i],
                         "labels": labels[i],
                         "scores": scores[i],
+                        "embeddings": embeddings[i],
                     }
                 )
 
