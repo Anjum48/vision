@@ -320,6 +320,12 @@ def paste_masks_in_image(masks, boxes, img_shape, padding=1):
 
 
 class RoIHeads(torch.nn.Module):
+    __annotations__ = {
+        'box_coder': det_utils.BoxCoder,
+        'proposal_matcher': det_utils.Matcher,
+        'fg_bg_sampler': det_utils.BalancedPositiveNegativeSampler,
+    }
+
     def __init__(self,
                  box_roi_pool,
                  box_head,
@@ -373,7 +379,6 @@ class RoIHeads(torch.nn.Module):
         self.keypoint_head = keypoint_head
         self.keypoint_predictor = keypoint_predictor
 
-    @property
     def has_mask(self):
         if self.mask_roi_pool is None:
             return False
@@ -383,7 +388,6 @@ class RoIHeads(torch.nn.Module):
             return False
         return True
 
-    @property
     def has_keypoint(self):
         if self.keypoint_roi_pool is None:
             return False
@@ -394,10 +398,12 @@ class RoIHeads(torch.nn.Module):
         return True
 
     def assign_targets_to_proposals(self, proposals, gt_boxes, gt_labels):
+        # type: (List[Tensor], List[Tensor], List[Tensor])
         matched_idxs = []
         labels = []
         for proposals_in_image, gt_boxes_in_image, gt_labels_in_image in zip(proposals, gt_boxes, gt_labels):
-            match_quality_matrix = self.box_similarity(gt_boxes_in_image, proposals_in_image)
+            #  set to self.box_similarity when https://github.com/pytorch/pytorch/issues/27495 lands
+            match_quality_matrix = box_ops.box_iou(gt_boxes_in_image, proposals_in_image)
             matched_idxs_in_image = self.proposal_matcher(match_quality_matrix)
 
             clamped_matched_idxs_in_image = matched_idxs_in_image.clamp(min=0)
@@ -407,17 +413,18 @@ class RoIHeads(torch.nn.Module):
 
             # Label background (below the low threshold)
             bg_inds = matched_idxs_in_image == self.proposal_matcher.BELOW_LOW_THRESHOLD
-            labels_in_image[bg_inds] = 0
+            labels_in_image[bg_inds] = torch.tensor(0)
 
             # Label ignore proposals (between low and high thresholds)
             ignore_inds = matched_idxs_in_image == self.proposal_matcher.BETWEEN_THRESHOLDS
-            labels_in_image[ignore_inds] = -1  # -1 is ignored by sampler
+            labels_in_image[ignore_inds] = torch.tensor(-1)  # -1 is ignored by sampler
 
             matched_idxs.append(clamped_matched_idxs_in_image)
             labels.append(labels_in_image)
         return matched_idxs, labels
 
     def subsample(self, labels):
+        # type: (List[Tensor])
         sampled_pos_inds, sampled_neg_inds = self.fg_bg_sampler(labels)
         sampled_inds = []
         for img_idx, (pos_inds_img, neg_inds_img) in enumerate(
@@ -428,6 +435,7 @@ class RoIHeads(torch.nn.Module):
         return sampled_inds
 
     def add_gt_proposals(self, proposals, gt_boxes):
+        # type: (List[Tensor], List[Tensor])
         proposals = [
             torch.cat((proposal, gt_box))
             for proposal, gt_box in zip(proposals, gt_boxes)
@@ -435,16 +443,27 @@ class RoIHeads(torch.nn.Module):
 
         return proposals
 
+    def DELTEME_all(self, the_list):
+        # type: (List[bool])
+        for i in the_list:
+            if not i:
+                return False
+        return True
+
     def check_targets(self, targets):
+        # type: (Optional[List[Dict[str, Tensor]]])
         assert targets is not None
-        assert all("boxes" in t for t in targets)
-        assert all("labels" in t for t in targets)
-        if self.has_mask:
-            assert all("masks" in t for t in targets)
+        assert self.DELTEME_all(["boxes" in t for t in targets])
+        assert self.DELTEME_all(["labels" in t for t in targets])
+        if self.has_mask():
+            assert self.DELTEME_all(["masks" in t for t in targets])
 
     def select_training_samples(self, proposals, targets):
+        # type: (List[Tensor], Optional[List[Dict[str, Tensor]]])
         self.check_targets(targets)
-        gt_boxes = [t["boxes"] for t in targets]
+        assert targets is not None
+        dtype = proposals[0].dtype
+        gt_boxes = [t["boxes"].to(dtype) for t in targets]
         gt_labels = [t["labels"] for t in targets]
 
         # append ground-truth bboxes to propos
@@ -466,7 +485,8 @@ class RoIHeads(torch.nn.Module):
         regression_targets = self.box_coder.encode(matched_gt_boxes, proposals)
         return proposals, matched_idxs, labels, regression_targets
 
-    def postprocess_detections(self, class_logits, box_regression, proposals, image_shapes):
+    def postprocess_detections(self, class_logits, box_regression, proposals, image_shapes, box_features):
+        # type: (Tensor, Tensor, List[Tensor], List[Tuple[int, int]])
         device = class_logits.device
         num_classes = class_logits.shape[-1]
 
@@ -476,13 +496,22 @@ class RoIHeads(torch.nn.Module):
         pred_scores = F.softmax(class_logits, -1)
 
         # split boxes and scores per image
-        pred_boxes = pred_boxes.split(boxes_per_image, 0)
-        pred_scores = pred_scores.split(boxes_per_image, 0)
+        if len(boxes_per_image) == 1:
+            # TODO : remove this when ONNX support dynamic split sizes
+            # and just assign to pred_boxes instead of pred_boxes_list
+            pred_boxes_list = [pred_boxes]
+            pred_scores_list = [pred_scores]
+            pred_embeddings_list = [box_features]
+        else:
+            pred_boxes_list = pred_boxes.split(boxes_per_image, 0)
+            pred_scores_list = pred_scores.split(boxes_per_image, 0)
+            pred_embeddings_list = box_features.split(boxes_per_image, 0)
 
         all_boxes = []
         all_scores = []
         all_labels = []
-        for boxes, scores, image_shape in zip(pred_boxes, pred_scores, image_shapes):
+        all_embeddings = []
+        for boxes, scores, image_shape, embeddings in zip(pred_boxes_list, pred_scores_list, image_shapes, pred_embeddings_list):
             boxes = box_ops.clip_boxes_to_image(boxes, image_shape)
 
             # create labels for each prediction
@@ -495,31 +524,34 @@ class RoIHeads(torch.nn.Module):
             labels = labels[:, 1:]
 
             # batch everything, by making every class prediction be a separate instance
+            embeddings = torch.repeat_interleave(embeddings, scores.size(1), 0)
             boxes = boxes.reshape(-1, 4)
-            scores = scores.flatten()
-            labels = labels.flatten()
+            scores = scores.reshape(-1)
+            labels = labels.reshape(-1)
 
             # remove low scoring boxes
             inds = torch.nonzero(scores > self.score_thresh).squeeze(1)
-            boxes, scores, labels = boxes[inds], scores[inds], labels[inds]
+            boxes, scores, labels, embeddings = boxes[inds], scores[inds], labels[inds], embeddings[inds]
 
             # remove empty boxes
             keep = box_ops.remove_small_boxes(boxes, min_size=1e-2)
-            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+            boxes, scores, labels, embeddings = boxes[keep], scores[keep], labels[keep], embeddings[keep]
 
             # non-maximum suppression, independently done per class
             keep = box_ops.batched_nms(boxes, scores, labels, self.nms_thresh)
             # keep only topk scoring predictions
             keep = keep[:self.detections_per_img]
-            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+            boxes, scores, labels, embeddings = boxes[keep], scores[keep], labels[keep], embeddings[keep]
 
             all_boxes.append(boxes)
             all_scores.append(scores)
             all_labels.append(labels)
+            all_embeddings.append(embeddings)
 
-        return all_boxes, all_scores, all_labels
+        return all_boxes, all_scores, all_labels, all_embeddings
 
     def forward(self, features, proposals, image_shapes, targets=None):
+        # type: (Dict[str, Tensor], List[Tensor], List[Tuple[int, int]], Optional[List[Dict[str, Tensor]]])
         """
         Arguments:
             features (List[Tensor])
@@ -529,38 +561,51 @@ class RoIHeads(torch.nn.Module):
         """
         if targets is not None:
             for t in targets:
-                assert t["boxes"].dtype.is_floating_point, 'target boxes must of float type'
+                # TODO: https://github.com/pytorch/pytorch/issues/26731
+                floating_point_types = (torch.float, torch.double, torch.half)
+                assert t["boxes"].dtype in floating_point_types, 'target boxes must of float type'
                 assert t["labels"].dtype == torch.int64, 'target labels must of int64 type'
-                if self.has_keypoint:
+                if self.has_keypoint():
                     assert t["keypoints"].dtype == torch.float32, 'target keypoints must of float type'
 
         if self.training:
             proposals, matched_idxs, labels, regression_targets = self.select_training_samples(proposals, targets)
+        else:
+            labels = None
+            regression_targets = None
+            matched_idxs = None
 
         box_features = self.box_roi_pool(features, proposals, image_shapes)
         box_features = self.box_head(box_features)
         class_logits, box_regression = self.box_predictor(box_features)
 
-        result, losses = [], {}
+        result = torch.jit.annotate(List[Dict[str, torch.Tensor]], [])
+        losses = {}
         if self.training:
+            assert labels is not None and regression_targets is not None
             loss_classifier, loss_box_reg = fastrcnn_loss(
                 class_logits, box_regression, labels, regression_targets)
-            losses = dict(loss_classifier=loss_classifier, loss_box_reg=loss_box_reg)
+            losses = {
+                "loss_classifier": loss_classifier,
+                "loss_box_reg": loss_box_reg
+            }
         else:
-            boxes, scores, labels = self.postprocess_detections(class_logits, box_regression, proposals, image_shapes)
+            boxes, scores, labels, embeddings = self.postprocess_detections(class_logits, box_regression, proposals, image_shapes, box_features)
             num_images = len(boxes)
             for i in range(num_images):
                 result.append(
-                    dict(
-                        boxes=boxes[i],
-                        labels=labels[i],
-                        scores=scores[i],
-                    )
+                    {
+                        "boxes": boxes[i],
+                        "labels": labels[i],
+                        "scores": scores[i],
+                        "embeddings": embeddings[i],
+                    }
                 )
 
-        if self.has_mask:
+        if self.has_mask():
             mask_proposals = [p["boxes"] for p in result]
             if self.training:
+                assert matched_idxs is not None
                 # during training, only focus on positive boxes
                 num_images = len(proposals)
                 mask_proposals = []
@@ -569,19 +614,31 @@ class RoIHeads(torch.nn.Module):
                     pos = torch.nonzero(labels[img_id] > 0).squeeze(1)
                     mask_proposals.append(proposals[img_id][pos])
                     pos_matched_idxs.append(matched_idxs[img_id][pos])
+            else:
+                pos_matched_idxs = None
 
-            mask_features = self.mask_roi_pool(features, mask_proposals, image_shapes)
-            mask_features = self.mask_head(mask_features)
-            mask_logits = self.mask_predictor(mask_features)
+            if self.mask_roi_pool is not None:
+                mask_features = self.mask_roi_pool(features, mask_proposals, image_shapes)
+                mask_features = self.mask_head(mask_features)
+                mask_logits = self.mask_predictor(mask_features)
+            else:
+                mask_logits = torch.tensor(0)
+                raise Exception("Expected mask_roi_pool to be not None")
 
             loss_mask = {}
             if self.training:
+                assert targets is not None
+                assert pos_matched_idxs is not None
+                assert mask_logits is not None
+
                 gt_masks = [t["masks"] for t in targets]
                 gt_labels = [t["labels"] for t in targets]
-                loss_mask = maskrcnn_loss(
+                rcnn_loss_mask = maskrcnn_loss(
                     mask_logits, mask_proposals,
                     gt_masks, gt_labels, pos_matched_idxs)
-                loss_mask = dict(loss_mask=loss_mask)
+                loss_mask = {
+                    "loss_mask": rcnn_loss_mask
+                }
             else:
                 labels = [r["labels"] for r in result]
                 masks_probs = maskrcnn_inference(mask_logits, labels)
@@ -590,17 +647,23 @@ class RoIHeads(torch.nn.Module):
 
             losses.update(loss_mask)
 
-        if self.has_keypoint:
+        # keep none checks in if conditional so torchscript will conditionally
+        # compile each branch
+        if self.keypoint_roi_pool is not None and self.keypoint_head is not None \
+                and self.keypoint_predictor is not None:
             keypoint_proposals = [p["boxes"] for p in result]
             if self.training:
                 # during training, only focus on positive boxes
                 num_images = len(proposals)
                 keypoint_proposals = []
                 pos_matched_idxs = []
+                assert matched_idxs is not None
                 for img_id in range(num_images):
                     pos = torch.nonzero(labels[img_id] > 0).squeeze(1)
                     keypoint_proposals.append(proposals[img_id][pos])
                     pos_matched_idxs.append(matched_idxs[img_id][pos])
+            else:
+                pos_matched_idxs = None
 
             keypoint_features = self.keypoint_roi_pool(features, keypoint_proposals, image_shapes)
             keypoint_features = self.keypoint_head(keypoint_features)
@@ -608,12 +671,20 @@ class RoIHeads(torch.nn.Module):
 
             loss_keypoint = {}
             if self.training:
+                assert targets is not None
+                assert pos_matched_idxs is not None
+
                 gt_keypoints = [t["keypoints"] for t in targets]
-                loss_keypoint = keypointrcnn_loss(
+                rcnn_loss_keypoint = keypointrcnn_loss(
                     keypoint_logits, keypoint_proposals,
                     gt_keypoints, pos_matched_idxs)
-                loss_keypoint = dict(loss_keypoint=loss_keypoint)
+                loss_keypoint = {
+                    "loss_keypoint": rcnn_loss_keypoint
+                }
             else:
+                assert keypoint_logits is not None
+                assert keypoint_proposals is not None
+
                 keypoints_probs, kp_scores = keypointrcnn_inference(keypoint_logits, keypoint_proposals)
                 for keypoint_prob, kps, r in zip(keypoints_probs, kp_scores, result):
                     r["keypoints"] = keypoint_prob
