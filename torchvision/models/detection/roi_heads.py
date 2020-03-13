@@ -579,8 +579,9 @@ class RoIHeads(torch.nn.Module):
         box_features = self.box_head(box_features)
         class_logits, box_regression = self.box_predictor(box_features)
 
-        result = torch.jit.annotate(List[Dict[str, torch.Tensor]], [])
-        losses = {}
+        # result = torch.jit.annotate(List[Dict[str, torch.Tensor]], [])
+        # losses = {}
+        result, losses = [], {}
         if self.training:
             assert labels is not None and regression_targets is not None
             loss_classifier, loss_box_reg = fastrcnn_loss(
